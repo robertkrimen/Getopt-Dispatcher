@@ -1,0 +1,210 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+package GtD;
+
+use Any::Moose;
+use Carp;
+
+use Path::TreeDispatcher;
+#use Carp::Always;
+
+has builder => qw/ is ro lazy_build 1 /;
+sub _build_builder {
+    my $self = shift;
+    return Path::TreeDispatcher::Builder->new(
+        parse_rule => \&_parse_rule,
+        parse_branch => \&_parse_branch,
+    );
+}
+
+has dispatcher => qw/ is ro lazy_build 1 /;
+sub _build_dispatcher {
+    my $self = shift;
+    return Path::TreeDispatcher->new(
+        root => $self->builder->build_branch,
+        build_context => 'GtD::Context',
+        build_local_context => 'GtD::LocalContext',
+    );
+}
+
+sub is_option_like ($) {
+    return $_[0] =~ m/^-/;
+}
+
+use Getopt::Long qw/GetOptionsFromArray/;
+sub consume_arguments ($$) { # Will modify arguments, reflecting consumption
+    my $argument_schema = shift;
+    my $arguments = shift;
+
+    my %options;
+    eval {
+        if ( $argument_schema && @$argument_schema ) {
+            Getopt::Long::Configure(qw/ pass_through /);
+            GetOptionsFromArray( $arguments, \%options, @$argument_schema );
+        }
+    };
+    croak "There was an error option-processing arguments: $@" if $@;
+
+    return ( \%options );
+}
+
+sub parse_argument_schema {
+    my $self = shift;
+    my $argument_schema = shift;
+    return sub {
+        my $ctx = shift;
+
+        my $arguments = [ grep { length && m/\S/ } split m/\s/, $ctx->path ];
+        my $options;
+        eval {
+            $options = consume_arguments $argument_schema, $arguments;
+            die "Unknown option-like argument" if @$arguments && is_option_like $arguments->[0];
+        };
+        die $@ if $@;
+
+        $ctx->set_options( $options );
+        $ctx->local->set_options( $options );
+        $ctx->path( join ' ', @$arguments ); # TODO How should we reconstitute the path?
+    };
+}
+
+sub _parse_rule {
+    my $builder = shift;
+    my $input = shift;
+
+    if ( defined $input && ref $input eq '' ) {
+        $input = qr/$input/;
+    }
+
+    return $builder->builtin_parse_rule( $input );
+}
+
+sub _parse_branch {
+    my $builder = shift;
+    my $rule = shift;
+    if ( ref $_[0] eq 'ARRAY' ) {
+        unshift @_, __PACKAGE__->parse_argument_schema( shift @_ );
+    }
+    elsif ( $_[0] && $_[0] eq '--' ) {
+        shift @_; 
+    }
+
+    return $builder->builtin_parse_branch( $rule, @_ );
+}
+
+package GtD::Context;
+
+use Any::Moose;
+
+extends qw/Path::TreeDispatcher::Context/;
+
+use Hash::MultiValue;
+
+has _options =>
+    qw/ is rw isa Hash::MultiValue lazy_build 1 /;
+sub _build__options {
+    my $self = shift;
+    return Hash::MultiValue->new;
+}
+
+sub option {
+    my $self = shift;
+    if ( @_ > 1 ) {
+        $self->_options->remove( $_[0] );
+        $self->_options->add( @_ );
+    }
+    return $self->_options->get( $_[0] );
+}
+sub set_options {
+    my $self = shift;
+    my $options = shift;
+    while (my ($key, $value) = each %$options) {
+        $self->_options->remove( $key );
+        $self->_options->add( $key => $value );
+    }
+}
+
+package GtD::LocalContext;
+
+use Any::Moose;
+
+extends qw/Path::TreeDispatcher::LocalContext/;
+
+use Hash::MultiValue;
+
+has _options =>
+    qw/ is rw isa Hash::MultiValue lazy_build 1 /;
+sub _build__options {
+    my $self = shift;
+    return Hash::MultiValue->new;
+}
+
+sub option {
+    my $self = shift;
+    if ( @_ > 1 ) {
+        $self->_options->remove( $_[0] );
+        $self->_options->add( @_ );
+    }
+    return $self->_options->get( $_[0] );
+}
+sub set_options {
+    my $self = shift;
+    my $options = shift;
+    $self->_options( Hash::MultiValue->new( %$options ) );
+}
+
+1;
+
+package main;
+
+use Test::Most;
+
+plan qw/no_plan/;
+
+my $gtc = GtD->new();
+
+ok( $gtc );
+ok( $gtc->dispatcher );
+
+sub path {
+    return $gtc->builder->parse_branch( @_ );
+}
+
+$gtc->dispatcher->root->add(
+    path( "apple", [ qw/ a1 b2:s / ],
+        sub {
+            my $ctx = shift;
+            diag "At apple\n";
+            ok( $ctx->option( 'a1' ) );
+            is( $ctx->local->option( 'a1' ), '1' );
+        },
+        path( "banana", [ qw/ a1:s / ],
+            sub {
+                my $ctx = shift;
+                diag "At banana\n";
+                $ctx->option( 'a1', 'a1' );
+                is( $ctx->option( 'b2' ), 'b2' );
+            },
+            path( "cherry", "--",
+                sub {
+                    my $ctx = shift;
+                    is( $ctx->path, ' --a2' );
+                },
+            ),
+        ),
+        sub {
+            diag "Post banana\n";
+            my $ctx = shift;
+            is( $ctx->option( 'a1' ), 'a1' );
+            is( $ctx->local->option( 'a1' ), '1' );
+        },
+    ),
+);
+
+$gtc->dispatcher->dispatch( "apple --a1 banana --b2 b2" );
+$gtc->dispatcher->dispatch( "apple --a1 banana --b2 b2 cherry --a2" );
+
+1;
