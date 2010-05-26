@@ -1,0 +1,140 @@
+#!/usr/bin/env perl
+
+use Modern::Perl;
+
+package Getopt::Dispatcher::Tree;
+
+use Any::Moose;
+
+extends qw/ Path::Tree /;
+
+sub _loader_arguments { qw/ Getopt::Dispatcher Path::Tree / }
+
+package Getopt::Dispatcher::Declare;
+
+use Any::Moose;
+
+extends qw/ Path::Tree::Declare /;
+
+override node_argument => sub {
+    my $self = shift;
+    my ( $build, $ii, $argument ) = @_;
+
+    return super unless $build->{rule};
+
+    if ( 1 <= $ii && ref $argument eq 'ARRAY' ) {
+        push @{ $build->{arguments} }, option_schema => $argument;
+    }
+    else { super }
+};
+
+package Getopt::Dispatcher::Node;
+
+use Any::Moose;
+use Carp;
+
+extends qw/ Path::Tree::Node /;
+
+has option_schema => qw/ is ro isa Maybe[ArrayRef] /;
+
+use Getopt::Long qw/GetOptionsFromArray/;
+use Text::ParseWords;
+sub consume_arguments ($$) { # Will modify options, reflecting consumption
+    my $option_schema = shift;
+    my $arguments = shift;
+
+    my %options;
+    eval {
+        if ( $option_schema && @$option_schema ) {
+            Getopt::Long::Configure(qw/ pass_through require_order /);
+            GetOptionsFromArray( $arguments, \%options, @$option_schema );
+        }
+    };
+    confess "There was an error processing options: $@" if $@;
+
+    return ( \%options );
+}
+
+after matched => sub {
+    my $self = shift;
+    my $match = shift;
+    
+    if ( my $schema = $self->option_schema ) {
+        my $leftover = $match->{leftover};
+        say "[$leftover]";
+        my $arguments = [ Text::ParseWords::shellwords( $leftover ) ];
+        my $options = consume_arguments $schema, $arguments;
+        $match->{leftover} = join ' ', @$arguments;
+        say "[$match->{leftover}]";
+    }
+};
+
+package main;
+
+my $tree = Getopt::Dispatcher::Tree->new;
+
+say $tree;
+say $tree->declare;
+
+$tree->root->branch( qr/xyzzy/ => [qw/ a1:s /] =>
+    sub {
+        my $ctx = shift;
+        say "At xyzzy";
+        say "option_schema: ", $ctx->tail->node->option_schema;
+        say $ctx->tail->leftover;
+    },
+    $tree->declare->node( qr/apple/ => sub {
+        say "At apple";
+    } ),
+);
+
+$tree->root->branch( $tree->declare->always => sub {
+    say "At the end";
+} );
+
+$tree->dispatch( 'xyzzy --a1 apple apple --b1 banana' );
+$tree->dispatch( 'yoink' );
+
+__END__
+
+sub is_option_like ($) {
+    return $_[0] =~ m/^-/;
+}
+
+use Getopt::Long qw/GetOptionsFromArray/;
+sub consume_arguments ($$) { # Will modify arguments, reflecting consumption
+    my $argument_schema = shift;
+    my $arguments = shift;
+
+    my %options;
+    eval {
+        if ( $argument_schema && @$argument_schema ) {
+            # TODO Look at GetOpionsFromString
+            Getopt::Long::Configure(qw/ pass_through require_order /);
+            GetOptionsFromArray( $arguments, \%options, @$argument_schema );
+        }
+    };
+    croak "There was an error option-processing arguments: $@" if $@;
+
+    return ( \%options );
+}
+
+sub parse_argument_schema {
+    my $self = shift;
+    my $argument_schema = shift;
+    return sub {
+        my $ctx = shift;
+
+        my $arguments = [ grep { length && m/\S/ } split m/\s/, $ctx->path ];
+        my $options;
+        eval {
+            $options = consume_arguments $argument_schema, $arguments;
+            die "Unknown option-like argument ($arguments->[0])" if @$arguments && is_option_like $arguments->[0];
+        };
+        die $@ if $@;
+
+        $ctx->set_options( $options );
+        $ctx->local->set_options( $options );
+        $ctx->path( join ' ', @$arguments ); # TODO How should we reconstitute the path?
+    };
+}
